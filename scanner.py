@@ -37,11 +37,7 @@ from tqdm import tqdm
 
 init(autoreset=True)
 
-# -------------------------------------------------------------------
-# Small local signature database for common service banners.
-# Real tools like nmap ship a huge probe/signature file; this is a
-# lightweight version covering common CTF/lab services.
-# -------------------------------------------------------------------
+# Service banner signatures for common protocols
 SIGNATURES = {
     "ssh": ["ssh-"],
     "ftp": ["220 ", "vsftpd", "proftpd", "filezilla"],
@@ -56,6 +52,7 @@ SIGNATURES = {
 }
 
 
+# Identify service by port number or banner fingerprint
 def identify_service(port, banner):
     """Try getservbyport first, then fall back to matching known banner
     signatures, so results are more accurate than the stdlib alone."""
@@ -74,6 +71,7 @@ def identify_service(port, banner):
     return base_name.upper() if base_name else "UNKNOWN"
 
 
+# Clean and trim banner text for display
 def clean_banner(raw, max_len=60):
     """Take the first printable line of a banner and trim it."""
     first_line = ""
@@ -88,6 +86,7 @@ def clean_banner(raw, max_len=60):
     return cleaned
 
 
+# Probe a TCP socket for a service banner
 def grab_tcp_banner(sock):
     try:
         sock.settimeout(1)
@@ -98,6 +97,7 @@ def grab_tcp_banner(sock):
         return ""
 
 
+# Guess a host OS from TTL values
 def guess_os_from_ttl(ttl):
     """Very rough OS guess based on typical default TTL values."""
     if ttl is None:
@@ -110,6 +110,7 @@ def guess_os_from_ttl(ttl):
         return "Network device / other (TTL>128)"
 
 
+# Get TTL value using the system ping command
 def get_ttl(target_ip):
     """Grab TTL from a raw ICMP-less method: use a TCP connect and read
     socket-level TTL isn't directly exposed cross-platform without raw
@@ -130,9 +131,7 @@ def get_ttl(target_ip):
     return None
 
 
-# -------------------------------------------------------------------
-# Scanning logic
-# -------------------------------------------------------------------
+# Scan a TCP port with optional banner grabbing and retries
 
 def scan_tcp_port(target_ip, port, timeout, grab_banners, retries):
     attempt = 0
@@ -156,6 +155,7 @@ def scan_tcp_port(target_ip, port, timeout, grab_banners, retries):
     return None
 
 
+# Scan a UDP port and classify it as open or open|filtered
 def scan_udp_port(target_ip, port, timeout, retries):
     """UDP is connectionless, so 'open' detection is best-effort:
     if we get any reply, or no ICMP port-unreachable comes back
@@ -180,7 +180,6 @@ def scan_udp_port(target_ip, port, timeout, retries):
                     "banner": banner,
                 }
             except socket.timeout:
-                # No response at all -> open|filtered (ambiguous in UDP)
                 sock.close()
                 return {
                     "port": port,
@@ -190,17 +189,13 @@ def scan_udp_port(target_ip, port, timeout, retries):
                     "banner": "",
                 }
         except OSError:
-            # ICMP port unreachable -> closed
             sock.close()
             return None
         attempt += 1
     return None
 
 
-# -------------------------------------------------------------------
-# Output helpers
-# -------------------------------------------------------------------
-
+# Save scan results as plain text
 def save_txt(all_results, filename="scan_results.txt"):
     with open(filename, "w") as f:
         for target_ip, entries in all_results.items():
@@ -214,12 +209,14 @@ def save_txt(all_results, filename="scan_results.txt"):
     print(Fore.YELLOW + f"Saved: {filename}")
 
 
+# Save scan results as JSON
 def save_json(all_results, filename="scan_results.json"):
     with open(filename, "w") as f:
         json.dump(all_results, f, indent=2)
     print(Fore.YELLOW + f"Saved: {filename}")
 
 
+# Save scan results as CSV
 def save_csv(all_results, filename="scan_results.csv"):
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
@@ -230,6 +227,7 @@ def save_csv(all_results, filename="scan_results.csv"):
     print(Fore.YELLOW + f"Saved: {filename}")
 
 
+# Save scan results as HTML report
 def save_html(all_results, os_guesses, elapsed, filename="scan_results.html"):
     rows = ""
     for target_ip, entries in all_results.items():
@@ -275,23 +273,18 @@ def save_html(all_results, os_guesses, elapsed, filename="scan_results.html"):
     print(Fore.YELLOW + f"Saved: {filename}")
 
 
-# -------------------------------------------------------------------
-# Target expansion (single IP / hostname / CIDR)
-# -------------------------------------------------------------------
-
+# Expand targets from single IP/hostname/CIDR to individual addresses
 def expand_targets(target_str):
     targets = []
     for part in target_str.split(","):
         part = part.strip()
         try:
-            # CIDR notation, e.g. 192.168.1.0/24
             net = ipaddress.ip_network(part, strict=False)
             if net.num_addresses > 1:
                 targets.extend([str(ip) for ip in net.hosts()])
             else:
                 targets.append(str(net.network_address))
         except ValueError:
-            # Not CIDR -> plain IP or hostname, resolve it
             try:
                 resolved = socket.gethostbyname(part)
                 targets.append(resolved)
@@ -300,10 +293,8 @@ def expand_targets(target_str):
     return targets
 
 
-# -------------------------------------------------------------------
-# Main scan orchestration
-# -------------------------------------------------------------------
-
+# Orchestrate scans across targets and ports
+# Run TCP/UDP scans against all targets and ports
 def run_scan(targets, start_port, end_port, timeout, grab_banners,
              retries, polite, do_udp, workers):
     all_results = {}
@@ -318,7 +309,7 @@ def run_scan(targets, start_port, end_port, timeout, grab_banners,
 
         def worker(port):
             if polite:
-                time.sleep(0.05)  # small delay to reduce noisiness
+                time.sleep(0.05)
             tcp_res = scan_tcp_port(target_ip, port, timeout, grab_banners, retries)
             if tcp_res:
                 found.append(tcp_res)
@@ -346,10 +337,8 @@ def run_scan(targets, start_port, end_port, timeout, grab_banners,
     return all_results, os_guesses
 
 
-# -------------------------------------------------------------------
-# Interactive mode (used when no CLI args are passed)
-# -------------------------------------------------------------------
-
+# Gather user input when no CLI arguments are provided
+# Prompt the user for scan settings when no CLI args are given
 def interactive_mode():
     print("=" * 40)
     print("      Python Port Scanner v8")
@@ -410,10 +399,7 @@ def interactive_mode():
     }
 
 
-# -------------------------------------------------------------------
-# CLI mode
-# -------------------------------------------------------------------
-
+# Parse command-line arguments for scan options
 def parse_cli_args():
     parser = argparse.ArgumentParser(description="Python Port Scanner v8")
     parser.add_argument("-t", "--target", help="Target IP, hostname, or CIDR (comma-separated for multiple)")
