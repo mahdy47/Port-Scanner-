@@ -1,43 +1,47 @@
 #!/usr/bin/env python3
 """
-Python Port Scanner v8
------------------------
-Upgrades included:
- 1. UDP scanning (in addition to TCP)
- 2. Progress bar (tqdm)
- 3. Export results as JSON / CSV (in addition to .txt)
- 4. Basic local service-signature fingerprinting (beyond getservbyport)
- 5. Retry logic for flaky connections
- 6. Rate limiting / "polite mode" (adds delay + fewer threads)
- 7. Simple OS fingerprinting via TTL
- 8. Multiple targets / CIDR range support (e.g. 192.168.1.0/24)
- 9. CLI arguments via argparse (still falls back to interactive mode if no args given)
-10. HTML report generation
+Python Port Scanner
+--------------------
+Scans TCP and UDP ports across one or more targets (IP, hostname, or CIDR).
 
-Usage examples:
-    python3 port_scanner_v8.py                     # interactive mode
-    python3 port_scanner_v8.py -t 192.168.1.10 -p 1-1000
-    python3 port_scanner_v8.py -t 192.168.1.0/24 -p 1-1000 --udp --polite
-    python3 port_scanner_v8.py -t 10.0.0.5 -p 1-65535 --save json,html,csv,txt
+Features:
+  - TCP and UDP scanning
+  - Service fingerprinting from banner signatures (fallback: getservbyport)
+  - Optional banner grabbing
+  - Retries for flaky connections
+  - "Polite" mode: a short delay and fewer threads per scan
+  - Rough OS guess from ping TTL
+  - Multiple targets / CIDR ranges
+  - CLI arguments, with an interactive fallback when none are given
+  - Results exportable as txt, json, csv, or html
+
+Examples:
+    python scanner.py                    # interactive mode
+    python scanner.py -t 192.168.1.10 -p 1-1000
+    python scanner.py -t 192.168.1.0/24 -p 1-1000 --udp --polite
+    python scanner.py -t 10.0.0.5 -p 1-65535 --save json,html,csv,txt
 """
 
 import socket
-import struct
 import time
-import threading
 import argparse
 import ipaddress
 import json
 import csv
-import os
+import html
+import subprocess
+import platform
+import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from colorama import Fore, init
-from tqdm import tqdm
 
 init(autoreset=True)
 
-# Service banner signatures for common protocols
+# Refuse to expand a network with more hosts than this (guards against typos like 0.0.0.0/0)
+MAX_HOSTS_PER_NETWORK = 1024
+
+# Signature patterns used to fingerprint common services
 SIGNATURES = {
     "ssh": ["ssh-"],
     "ftp": ["220 ", "vsftpd", "proftpd", "filezilla"],
@@ -52,7 +56,7 @@ SIGNATURES = {
 }
 
 
-# Identify service by port number or banner fingerprint
+# getservbyport for known ports, banner signatures as a fallback
 def identify_service(port, banner):
     """Try getservbyport first, then fall back to matching known banner
     signatures, so results are more accurate than the stdlib alone."""
@@ -71,7 +75,7 @@ def identify_service(port, banner):
     return base_name.upper() if base_name else "UNKNOWN"
 
 
-# Clean and trim banner text for display
+# First non-empty line of a banner, printable chars only, capped at 60
 def clean_banner(raw, max_len=60):
     """Take the first printable line of a banner and trim it."""
     first_line = ""
@@ -86,7 +90,7 @@ def clean_banner(raw, max_len=60):
     return cleaned
 
 
-# Probe a TCP socket for a service banner
+# Ask the service for a banner by sending a CRLF
 def grab_tcp_banner(sock):
     try:
         sock.settimeout(1)
@@ -97,7 +101,7 @@ def grab_tcp_banner(sock):
         return ""
 
 
-# Guess a host OS from TTL values
+# Rough OS guess from the TTL of the first ping reply
 def guess_os_from_ttl(ttl):
     """Very rough OS guess based on typical default TTL values."""
     if ttl is None:
@@ -110,17 +114,15 @@ def guess_os_from_ttl(ttl):
         return "Network device / other (TTL>128)"
 
 
-# Get TTL value using the system ping command
+# TTL isn't exposed through plain sockets cross-platform, so read it from ping
 def get_ttl(target_ip):
-    """Grab TTL from a raw ICMP-less method: use a TCP connect and read
-    socket-level TTL isn't directly exposed cross-platform without raw
-    sockets/root, so we approximate using the `ping` command output."""
+    """Shell out to ping and parse TTL from its output; None if it fails."""
     try:
-        import subprocess
-        result = subprocess.run(
-            ["ping", "-c", "1", "-W", "1", target_ip],
-            capture_output=True, text=True
-        )
+        if platform.system().lower() == "windows":
+            ping_cmd = ["ping", "-n", "1", "-w", "1000", target_ip]
+        else:
+            ping_cmd = ["ping", "-c", "1", "-W", "1", target_ip]
+        result = subprocess.run(ping_cmd, capture_output=True, text=True)
         for line in result.stdout.splitlines():
             if "ttl=" in line.lower():
                 part = line.lower().split("ttl=")[1]
@@ -131,73 +133,67 @@ def get_ttl(target_ip):
     return None
 
 
-# Scan a TCP port with optional banner grabbing and retries
+# Every result has the same fields, so build them once here
+def _result(port, protocol, state, service, banner):
+    return {
+        "port": port,
+        "protocol": protocol,
+        "state": state,
+        "service": service,
+        "banner": banner,
+    }
 
+
+# Print one result line in the chosen color
+def _format_open_line(res, color):
+    line = f"{res['port']:<6} {res['protocol'].upper():<4} {res['state']:<14} {res['service']:<12}"
+    if res["banner"]:
+        line += f" | {res['banner']}"
+    print(color + line)
+
+
+# Try a TCP connect (optionally grabbing a banner), retrying on failure
 def scan_tcp_port(target_ip, port, timeout, grab_banners, retries):
-    attempt = 0
-    while attempt <= retries:
+    for _ in range(retries + 1):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        result = sock.connect_ex((target_ip, port))
-        if result == 0:
-            banner = grab_tcp_banner(sock) if grab_banners else ""
-            service = identify_service(port, banner)
+        try:
+            sock.settimeout(timeout)
+            result = sock.connect_ex((target_ip, port))
+            if result == 0:
+                banner = grab_tcp_banner(sock) if grab_banners else ""
+                return _result(port, "tcp", "open", identify_service(port, banner), banner)
+        except OSError:
+            pass
+        finally:
             sock.close()
-            return {
-                "port": port,
-                "protocol": "tcp",
-                "state": "open",
-                "service": service,
-                "banner": banner,
-            }
-        sock.close()
-        attempt += 1
     return None
 
 
-# Scan a UDP port and classify it as open or open|filtered
+# Best-effort UDP probe: a reply means open, a timeout means open|filtered
 def scan_udp_port(target_ip, port, timeout, retries):
-    """UDP is connectionless, so 'open' detection is best-effort:
-    if we get any reply, or no ICMP port-unreachable comes back
-    within the timeout, we mark it open|filtered (same convention
-    nmap uses for UDP)."""
-    attempt = 0
-    while attempt <= retries:
+    """UDP has no handshake, so 'open' only happens when the service replies.
+    A silent port gets open|filtered (nmap's convention)."""
+    for _ in range(retries + 1):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
         try:
+            sock.settimeout(timeout)
             sock.sendto(b"\x00", (target_ip, port))
             try:
                 data, _ = sock.recvfrom(1024)
                 banner = clean_banner(data.decode(errors="ignore"))
-                service = identify_service(port, banner)
-                sock.close()
-                return {
-                    "port": port,
-                    "protocol": "udp",
-                    "state": "open",
-                    "service": service,
-                    "banner": banner,
-                }
+                return _result(port, "udp", "open", identify_service(port, banner), banner)
             except socket.timeout:
-                sock.close()
-                return {
-                    "port": port,
-                    "protocol": "udp",
-                    "state": "open|filtered",
-                    "service": identify_service(port, ""),
-                    "banner": "",
-                }
+                return _result(port, "udp", "open|filtered", identify_service(port, ""), "")
         except OSError:
-            sock.close()
             return None
-        attempt += 1
+        finally:
+            sock.close()
     return None
 
 
 # Save scan results as plain text
 def save_txt(all_results, filename="scan_results.txt"):
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding="utf-8") as f:
         for target_ip, entries in all_results.items():
             f.write(f"Target: {target_ip}\n\n")
             for e in entries:
@@ -211,19 +207,30 @@ def save_txt(all_results, filename="scan_results.txt"):
 
 # Save scan results as JSON
 def save_json(all_results, filename="scan_results.json"):
-    with open(filename, "w") as f:
+    with open(filename, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
     print(Fore.YELLOW + f"Saved: {filename}")
 
 
+# Neutralize CSV formula injection: prefix cells Excel would evaluate as formulas
+def _csv_safe(value):
+    s = str(value)
+    if s.startswith(("=", "+", "-", "@")):
+        return "'" + s
+    return s
+
+
 # Save scan results as CSV
 def save_csv(all_results, filename="scan_results.csv"):
-    with open(filename, "w", newline="") as f:
+    with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["target", "port", "protocol", "state", "service", "banner"])
         for target_ip, entries in all_results.items():
             for e in entries:
-                writer.writerow([target_ip, e["port"], e["protocol"], e["state"], e["service"], e["banner"]])
+                writer.writerow([
+                    _csv_safe(target_ip), e["port"], _csv_safe(e["protocol"]),
+                    _csv_safe(e["state"]), _csv_safe(e["service"]), _csv_safe(e["banner"]),
+                ])
     print(Fore.YELLOW + f"Saved: {filename}")
 
 
@@ -231,18 +238,18 @@ def save_csv(all_results, filename="scan_results.csv"):
 def save_html(all_results, os_guesses, elapsed, filename="scan_results.html"):
     rows = ""
     for target_ip, entries in all_results.items():
-        os_guess = os_guesses.get(target_ip, "Unknown")
-        rows += f'<tr><td colspan="5" class="target-row">Target: {target_ip} &mdash; OS guess: {os_guess}</td></tr>\n'
+        os_guess = html.escape(os_guesses.get(target_ip, "Unknown"))
+        rows += f'<tr><td colspan="5" class="target-row">Target: {html.escape(target_ip)} &mdash; OS guess: {os_guess}</td></tr>\n'
         for e in entries:
             rows += (
                 "<tr>"
-                f"<td>{e['port']}</td><td>{e['protocol'].upper()}</td>"
-                f"<td>{e['state']}</td><td>{e['service']}</td>"
-                f"<td>{e['banner']}</td>"
+                f"<td>{e['port']}</td><td>{html.escape(e['protocol'].upper())}</td>"
+                f"<td>{html.escape(e['state'])}</td><td>{html.escape(e['service'])}</td>"
+                f"<td>{html.escape(e['banner'])}</td>"
                 "</tr>\n"
             )
 
-    html = f"""<!DOCTYPE html>
+    page = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -268,12 +275,12 @@ def save_html(all_results, os_guesses, elapsed, filename="scan_results.html"):
 </body>
 </html>"""
 
-    with open(filename, "w") as f:
-        f.write(html)
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(page)
     print(Fore.YELLOW + f"Saved: {filename}")
 
 
-# Expand targets from single IP/hostname/CIDR to individual addresses
+# Turn a comma-separated list of IPs, hostnames, and CIDRs into IP addresses
 def expand_targets(target_str):
     targets = []
     for part in target_str.split(","):
@@ -281,6 +288,9 @@ def expand_targets(target_str):
         try:
             net = ipaddress.ip_network(part, strict=False)
             if net.num_addresses > 1:
+                if net.num_addresses > MAX_HOSTS_PER_NETWORK + 2:
+                    print(Fore.YELLOW + f"Skipping {part}: expands to more than {MAX_HOSTS_PER_NETWORK} hosts")
+                    continue
                 targets.extend([str(ip) for ip in net.hosts()])
             else:
                 targets.append(str(net.network_address))
@@ -293,8 +303,7 @@ def expand_targets(target_str):
     return targets
 
 
-# Orchestrate scans across targets and ports
-# Run TCP/UDP scans against all targets and ports
+# Scan every target: OS guess first, then TCP/UDP across the port range
 def run_scan(targets, start_port, end_port, timeout, grab_banners,
              retries, polite, do_udp, workers):
     all_results = {}
@@ -313,19 +322,13 @@ def run_scan(targets, start_port, end_port, timeout, grab_banners,
             tcp_res = scan_tcp_port(target_ip, port, timeout, grab_banners, retries)
             if tcp_res:
                 found.append(tcp_res)
-                line = f"{tcp_res['port']:<6} TCP  OPEN    {tcp_res['service']:<12}"
-                if tcp_res["banner"]:
-                    line += f" | {tcp_res['banner']}"
-                print(Fore.GREEN + line)
+                _format_open_line(tcp_res, Fore.GREEN)
 
             if do_udp:
                 udp_res = scan_udp_port(target_ip, port, timeout, retries)
-                if udp_res:
+                if udp_res and udp_res["state"] == "open":
                     found.append(udp_res)
-                    line = f"{udp_res['port']:<6} UDP  {udp_res['state']:<14} {udp_res['service']:<12}"
-                    if udp_res["banner"]:
-                        line += f" | {udp_res['banner']}"
-                    print(Fore.CYAN + line)
+                    _format_open_line(udp_res, Fore.CYAN)
 
         max_workers = 50 if polite else workers
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -337,8 +340,44 @@ def run_scan(targets, start_port, end_port, timeout, grab_banners,
     return all_results, os_guesses
 
 
-# Gather user input when no CLI arguments are provided
-# Prompt the user for scan settings when no CLI args are given
+def parse_port_range(spec):
+    """Parse "start-end" (or a bare single port) into a valid (start, end)
+    pair, or None after printing what's wrong with it."""
+    try:
+        parts = spec.split("-")
+        if len(parts) == 1:
+            start = end = int(parts[0])
+        else:
+            start, end = map(int, parts)
+    except ValueError:
+        print(Fore.RED + "Invalid port range format, use e.g. 1-1000")
+        return None
+    if not (0 < start <= end <= 65535):
+        print(Fore.RED + "Invalid port range, use e.g. 1-1000 (max 65535)")
+        return None
+    return start, end
+
+
+def _parse_save_formats(spec):
+    return [s.strip() for s in spec.split(",") if s.strip()]
+
+
+def _build_config(targets, start_port, end_port, timeout, grab_banners,
+                  do_udp, polite, retries, save_formats):
+    return {
+        "targets": targets,
+        "start_port": start_port,
+        "end_port": end_port,
+        "timeout": timeout,
+        "grab_banners": grab_banners,
+        "do_udp": do_udp,
+        "polite": polite,
+        "retries": retries,
+        "save_formats": save_formats,
+    }
+
+
+# Ask for scan settings when no CLI arguments were given
 def interactive_mode():
     print("=" * 40)
     print("      Python Port Scanner v8")
@@ -354,15 +393,10 @@ def interactive_mode():
     if choice == "1":
         start_port, end_port = 1, 10000
     elif choice == "2":
-        try:
-            start_port = int(input("Start Port: "))
-            end_port = int(input("End Port: "))
-        except ValueError:
-            print(Fore.RED + "Please enter numbers only!")
+        parsed = parse_port_range(f"{input('Start Port: ')}-{input('End Port: ')}")
+        if parsed is None:
             exit()
-        if not (0 < start_port <= end_port <= 65535):
-            print(Fore.RED + "Invalid port range!")
-            exit()
+        start_port, end_port = parsed
     else:
         print(Fore.RED + "Invalid Choice!")
         exit()
@@ -386,17 +420,11 @@ def interactive_mode():
         "\nSave results? Enter formats comma-separated (txt,json,csv,html) or blank to skip: "
     ).strip()
 
-    return {
-        "targets": expand_targets(target_str),
-        "start_port": start_port,
-        "end_port": end_port,
-        "timeout": timeout,
-        "grab_banners": grab_banners,
-        "do_udp": do_udp,
-        "polite": polite,
-        "retries": retries,
-        "save_formats": [s.strip() for s in save_choice.split(",") if s.strip()],
-    }
+    return _build_config(
+        expand_targets(target_str), start_port, end_port, timeout,
+        grab_banners, do_udp, polite, retries,
+        _parse_save_formats(save_choice),
+    )
 
 
 # Parse command-line arguments for scan options
@@ -417,24 +445,27 @@ def parse_cli_args():
 def main():
     args = parse_cli_args()
 
-    if args.target:
-        try:
-            start_port, end_port = map(int, args.ports.split("-"))
-        except ValueError:
-            print(Fore.RED + "Invalid port range format, use e.g. 1-1000")
-            return
+    if args.workers < 1:
+        print(Fore.RED + "--workers must be at least 1")
+        sys.exit(1)
+    if args.timeout <= 0:
+        print(Fore.RED + "--timeout must be greater than 0")
+        sys.exit(1)
+    if args.retries < 0:
+        print(Fore.RED + "--retries must be 0 or greater")
+        sys.exit(1)
 
-        config = {
-            "targets": expand_targets(args.target),
-            "start_port": start_port,
-            "end_port": end_port,
-            "timeout": args.timeout,
-            "grab_banners": args.banners,
-            "do_udp": args.udp,
-            "polite": args.polite,
-            "retries": args.retries,
-            "save_formats": [s.strip() for s in args.save.split(",") if s.strip()],
-        }
+    if args.target:
+        parsed = parse_port_range(args.ports)
+        if parsed is None:
+            sys.exit(1)
+        start_port, end_port = parsed
+
+        config = _build_config(
+            expand_targets(args.target), start_port, end_port, args.timeout,
+            args.banners, args.udp, args.polite, args.retries,
+            _parse_save_formats(args.save),
+        )
         workers = args.workers
     else:
         config = interactive_mode()
@@ -442,7 +473,7 @@ def main():
 
     if not config["targets"]:
         print(Fore.RED + "No valid targets to scan.")
-        return
+        sys.exit(1)
 
     start_time = time.time()
     all_results, os_guesses = run_scan(
@@ -462,15 +493,16 @@ def main():
     print(f"Open Ports  : {total_open}")
     print(f"Time        : {elapsed:.2f} seconds")
 
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
     for fmt in config["save_formats"]:
         if fmt == "txt":
-            save_txt(all_results)
+            save_txt(all_results, f"scan_{timestamp}.txt")
         elif fmt == "json":
-            save_json(all_results)
+            save_json(all_results, f"scan_{timestamp}.json")
         elif fmt == "csv":
-            save_csv(all_results)
+            save_csv(all_results, f"scan_{timestamp}.csv")
         elif fmt == "html":
-            save_html(all_results, os_guesses, elapsed)
+            save_html(all_results, os_guesses, elapsed, f"scan_{timestamp}.html")
         else:
             print(Fore.RED + f"Unknown save format: {fmt}")
 
